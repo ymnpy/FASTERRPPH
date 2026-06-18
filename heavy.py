@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QGroupBox, QFileDialog,
     QSplitter, QComboBox, QProgressBar, QFrame, QCheckBox,
-    QSizePolicy, QSlider
+    QSizePolicy, QSlider, QTextEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 
@@ -46,19 +46,47 @@ COLOR_CBUSH      = "#3b82f6"
 OPACITY_SHELL    = 0.35
 
 # =============================================================================
-# GEOMETRY BUILDERS — cylinder only, real triangulated mesh
+# GEOMETRY BUILDERS
 # =============================================================================
-def _make_cylinder_mesh(pts: np.ndarray, radius: float,
+def _rotation_to_align(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix that rotates unit vector v_from onto unit vector v_to."""
+    a, b = v_from, v_to
+    cross = np.cross(a, b)
+    dot   = np.clip(np.dot(a, b), -1.0, 1.0)
+    s     = np.linalg.norm(cross)
+
+    if s < 1e-9:
+        if dot > 0:
+            return np.eye(3)
+        # 180 degree flip - pick any axis perpendicular to a
+        ortho = np.array([1.0, 0.0, 0.0])
+        if abs(a[0]) > 0.9:
+            ortho = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, ortho)
+        axis /= np.linalg.norm(axis)
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        return np.eye(3) + 2 * K @ K
+
+    K = np.array([[0, -cross[2], cross[1]],
+                  [cross[2], 0, -cross[0]],
+                  [-cross[1], cross[0], 0]])
+    return np.eye(3) + K + K @ K * ((1 - dot) / (s ** 2))
+
+
+def _make_fastener_mesh(p1_arr: np.ndarray, p2_arr: np.ndarray, radius: float,
                         scalar_vals: np.ndarray = None,
                         scalar_name: str = "val") -> pv.PolyData:
-    """Merge N upright cylinders into one PolyData (software-OpenGL safe)."""
-    n = len(pts)
+    """Build N cylinders, each spanning its own p1->p2 axis (real fastener orientation)."""
+    n = len(p1_arr)
     if n == 0:
         return pv.PolyData()
-    height   = radius * 2.5
-    template = pv.Cylinder(radius=radius, height=height,
+
+    base_dir = np.array([0.0, 0.0, 1.0])
+    template = pv.Cylinder(radius=radius, height=1.0,
                            direction=(0, 0, 1), resolution=16).triangulate()
-    tv = template.points
+    tv = template.points          # centered at origin, height 1 along Z
     tf = template.faces.reshape(-1, 4)[:, 1:]
     V, F = len(tv), len(tf)
 
@@ -67,8 +95,23 @@ def _make_cylinder_mesh(pts: np.ndarray, radius: float,
     if scalar_vals is not None:
         all_sc = np.empty(n * V, dtype=np.float64)
 
-    for i, c in enumerate(pts):
-        all_pts  [i*V:(i+1)*V] = tv + c
+    for i in range(n):
+        p1, p2 = p1_arr[i], p2_arr[i]
+        axis   = p2 - p1
+        length = np.linalg.norm(axis)
+        if length < 1e-9:
+            length = radius * 2.5
+            axis   = base_dir
+        direction = axis / length
+        center    = (p1 + p2) / 2.0
+
+        R = _rotation_to_align(base_dir, direction)
+        scaled    = tv.copy()
+        scaled[:, 2] *= length
+        rotated   = scaled @ R.T
+        world_pts = rotated + center
+
+        all_pts  [i*V:(i+1)*V] = world_pts
         all_faces[i*F:(i+1)*F] = tf + i * V
         if scalar_vals is not None:
             all_sc[i*V:(i+1)*V] = scalar_vals[i]
@@ -82,7 +125,7 @@ def _make_cylinder_mesh(pts: np.ndarray, radius: float,
 
 
 def _cbush_radius(bounds, scale: float = 1.0) -> float:
-    """World-unit cylinder radius from cached bounds tuple × user scale."""
+    """World-unit cylinder radius derived from model bounds."""
     try:
         dims    = [abs(bounds[1]-bounds[0]),
                    abs(bounds[3]-bounds[2]),
@@ -115,6 +158,47 @@ class BDFLoader(QThread):
 
 
 # =============================================================================
+# CALC THREAD  (wire your logic here)
+# =============================================================================
+class CalcThread(QThread):
+    done = pyqtSignal(str, str)
+
+    def __init__(self, xlsm, run_metal, run_composite,
+                 df_fastpph, df_joint, bdf_path):
+        super().__init__()
+        self.xlsm          = xlsm
+        self.run_metal     = run_metal
+        self.run_composite = run_composite
+        self.df_fastpph    = df_fastpph
+        self.df_joint      = df_joint
+        self.bdf_path      = bdf_path
+
+    def run(self):
+        try:
+            import xlwings as xw
+
+            out_dir  = os.path.dirname(self.bdf_path) or "."
+            out_path = os.path.join(out_dir, "fastener_results.xlsx")
+
+            app = xw.App(visible=False)
+            wb  = app.books.open(self.xlsm)
+            ws  = wb.sheets["YourSheet"]
+
+            # ... write inputs, calculate, read outputs ...
+
+            # Write results to a fresh workbook
+            import pandas as pd
+            df_results = pd.DataFrame({...})
+            df_results.to_excel(out_path, sheet_name="Results", index=False)
+
+            wb.close()
+            app.quit()
+
+            self.done.emit(out_path, "")
+        except Exception as e:
+            self.done.emit("", str(e))
+
+# =============================================================================
 # MAIN WINDOW
 # =============================================================================
 class FastenerViewer(QMainWindow):
@@ -125,21 +209,29 @@ class FastenerViewer(QMainWindow):
         self.setGeometry(60, 60, 1600, 900)
         self.setMinimumSize(800, 500)
 
+        # ── data ──────────────────────────────────────────────────────────────
         self.bdf            = None
         self.df_fastpph     = None
+        self.df_joint       = None
         self.df_output      = None
+        self._xlsm_path     = None
+
+        # ── render state ──────────────────────────────────────────────────────
         self._bdf_loader    = None
+        self._calc_thread   = None
         self._shell_actor   = None
         self._cbush_actor   = None
         self._rod_actors    = []
         self._pts_cache     = None
         self._nmap_cache    = None
-        self._cbush_centers = {}
+        self._cbush_centers   = {}
+        self._cbush_endpoints = {}
         self._scalar_bar    = None
         self._radius_scale  = 1.0
-        self._cached_bounds = None   # bounds snapshot taken after BDF render
-        self._label_actors  = []     # 3-D label actors
-        self._labels_on     = False  # toggle state
+        self._base_radius   = None   # set once after first BDF render
+        self._cached_bounds = None   # bounds snapshot taken right after shells render
+        self._label_actors  = []
+        self._labels_on     = False
 
         self._init_ui()
 
@@ -153,10 +245,10 @@ class FastenerViewer(QMainWindow):
     # =========================================================================
     def _init_ui(self):
         self.setStyleSheet(f"""
-            QMainWindow, QWidget {{ background-color: {BG}; color: {FG}; }}
-            QSplitter::handle    {{ background-color: {BORDER}; }}
-            QScrollBar:vertical  {{ background: {CARD}; width: 8px; border-radius: 4px; }}
-            QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; }}
+            QMainWindow, QWidget {{ background-color:{BG}; color:{FG}; }}
+            QSplitter::handle    {{ background-color:{BORDER}; }}
+            QScrollBar:vertical  {{ background:{CARD}; width:8px; border-radius:4px; }}
+            QScrollBar::handle:vertical {{ background:{BORDER}; border-radius:4px; }}
             QToolTip {{ background:{CARD}; color:{FG}; border:1px solid {BORDER}; }}
         """)
         central = QWidget()
@@ -189,6 +281,7 @@ class FastenerViewer(QMainWindow):
             f"padding:6px 0 4px 0;letter-spacing:1px;")
         lay.addWidget(title)
 
+        # ── Input files ───────────────────────────────────────────────────────
         fg = QGroupBox("Input Files")
         fg.setStyleSheet(self._group_style())
         fl = QVBoxLayout(); fl.setSpacing(6)
@@ -204,24 +297,29 @@ class FastenerViewer(QMainWindow):
             lbl.setStyleSheet(f"color:{FG_DIM};font-size:10px;")
             fl.addWidget(lbl)
             row  = QHBoxLayout()
-            edit = QLineEdit(); edit.setReadOnly(True)
+            edit = QLineEdit()
+            edit.setReadOnly(True)
             edit.setPlaceholderText("Not loaded")
             edit.setStyleSheet(self._edit_style())
-            btn  = QPushButton("Browse"); btn.setFixedWidth(68)
+            btn  = QPushButton("Browse")
+            btn.setFixedWidth(68)
             btn.setStyleSheet(self._btn_style())
-            btn.clicked.connect(
-                lambda _, a=attr, f=filt: self._browse_file(a, f))
-            row.addWidget(edit); row.addWidget(btn)
+            btn.clicked.connect(lambda _, a=attr, f=filt: self._browse_file(a, f))
+            row.addWidget(edit)
+            row.addWidget(btn)
             fl.addLayout(row)
             setattr(self, attr, edit)
 
         fg.setLayout(fl)
         lay.addWidget(fg)
 
+        # ── Calculation ───────────────────────────────────────────────────────
         cg = QGroupBox("Calculation")
         cg.setStyleSheet(self._group_style())
         cl = QVBoxLayout(); cl.setSpacing(6)
 
+        # Checkboxes side by side
+        chk_row = QHBoxLayout()
         chk_ss = f"font-size:11px;color:{FG};"
         self.chk_metal     = QCheckBox("Metallic")
         self.chk_composite = QCheckBox("Composite")
@@ -229,41 +327,81 @@ class FastenerViewer(QMainWindow):
         self.chk_composite.setChecked(True)
         self.chk_metal.setStyleSheet(chk_ss)
         self.chk_composite.setStyleSheet(chk_ss)
+        chk_row.addWidget(self.chk_metal)
+        chk_row.addWidget(self.chk_composite)
+        chk_row.addStretch()
+        cl.addLayout(chk_row)
 
+        # Progress bar always visible, inside the group
+        cl.addSpacing(15)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(20)
+        self.progress.setTextVisible(False)
+        self.progress.setStyleSheet(f"""
+            QProgressBar       {{ border:none; background:{BORDER}; border-radius:2px; }}
+            QProgressBar::chunk {{ background:{ACCENT}; border-radius:2px; }}
+        """)
+        cl.addWidget(self.progress)
+
+        # Gap then Calculate
+        cl.addSpacing(15)
         self.calc_btn = QPushButton("Calculate")
         self.calc_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color:{ACCENT}; color:white; border:none;
                 border-radius:4px; padding:7px; font-weight:bold; font-size:11px;
             }}
-            QPushButton:hover   {{ background-color:{ACCENT_HOV}; }}
-            QPushButton:disabled{{ background-color:{BORDER}; color:{FG_DIM}; }}
+            QPushButton:hover    {{ background-color:{ACCENT_HOV}; }}
+            QPushButton:disabled {{ background-color:{BORDER}; color:{FG_DIM}; }}
         """)
         self.calc_btn.clicked.connect(self._on_calculate)
-
-        cl.addWidget(self.chk_metal)
-        cl.addWidget(self.chk_composite)
         cl.addWidget(self.calc_btn)
+
         cg.setLayout(cl)
         lay.addWidget(cg)
 
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100); self.progress.setValue(0)
-        self.progress.setVisible(False); self.progress.setFixedHeight(4)
-        self.progress.setTextVisible(False)
-        self.progress.setStyleSheet(f"""
-            QProgressBar {{ border:none; background:{BORDER}; border-radius:2px; }}
-            QProgressBar::chunk {{ background:{ACCENT}; border-radius:2px; }}
-        """)
-        lay.addWidget(self.progress)
-
+        # Status label below the group
         self.status_lbl = QLabel("Load a BDF file to begin.")
         self.status_lbl.setWordWrap(True)
-        self.status_lbl.setStyleSheet(
-            f"color:{FG_DIM};font-size:10px;padding:2px 0;")
+        self.status_lbl.setStyleSheet(f"color:{FG_DIM};font-size:10px;padding:2px 0;")
         lay.addWidget(self.status_lbl)
 
+        # ── LOG ──────────────────────────────────────────────────────────────
         lay.addStretch()
+        log_hdr_row = QHBoxLayout()
+        log_hdr = QLabel("Log")
+        log_hdr.setStyleSheet(f"font-weight:bold;font-size:10px;margin-top:4px;color:{FG};")
+        self.log_toggle_btn = QPushButton("▼")
+        self.log_toggle_btn.setFixedSize(20, 20)
+        self.log_toggle_btn.setToolTip("Collapse log")
+        self.log_toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                border:1px solid {BORDER}; border-radius:3px;
+                background:{BG}; color:{FG}; font-size:10px;
+            }}
+            QPushButton:hover {{ background:{ACCENT}; color:white; border-color:{ACCENT}; }}
+        """)
+        self.log_toggle_btn.clicked.connect(self._toggle_log)
+        log_hdr_row.addWidget(log_hdr)
+        log_hdr_row.addStretch()
+        log_hdr_row.addWidget(self.log_toggle_btn)
+        lay.addLayout(log_hdr_row)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(600)
+        self.log_text.setStyleSheet(f"""
+            QTextEdit {{
+                background:{BG}; color:{FG_MONO};
+                border:1px solid {BORDER}; border-radius:4px;
+                font-family:monospace; font-size:10px;
+                padding:4px;
+            }}
+        """)
+        lay.addWidget(self.log_text, stretch=1)
+
         return panel
 
     # -------------------------------------------------------------------------
@@ -279,10 +417,8 @@ class FastenerViewer(QMainWindow):
         try:
             self.plotter = QtInteractor(panel)
             self.plotter.set_background(BG)
-            self.plotter.add_axes(
-                color=FG_DIM, viewport=(0.0, 0.0, 0.10, 0.13))
-            self.plotter.track_click_position(
-                callback=self._on_click, side='right')
+            self.plotter.add_axes(color=FG_DIM, viewport=(0.0, 0.0, 0.10, 0.13))
+            self.plotter.track_click_position(callback=self._on_click, side='right')
             lay.addWidget(self.plotter.interactor)
         except Exception as e:
             self.plotter = None
@@ -295,8 +431,8 @@ class FastenerViewer(QMainWindow):
         bar = QWidget()
         bar.setFixedHeight(52)
         bar.setStyleSheet(f"""
-            QWidget   {{ background-color:{CARD}; border-top:1px solid {BORDER}; }}
-            QLabel    {{ font-size:10px; color:{FG_DIM}; background:transparent; }}
+            QWidget {{ background-color:{CARD}; border-top:1px solid {BORDER}; }}
+            QLabel  {{ font-size:10px; color:{FG_DIM}; background:transparent; }}
             QComboBox {{
                 border:1px solid {BORDER}; border-radius:3px;
                 padding:3px 7px; font-size:10px;
@@ -312,7 +448,9 @@ class FastenerViewer(QMainWindow):
                 padding:4px 10px; font-size:10px;
                 background:{BG}; color:{FG}; font-weight:600;
             }}
-            QPushButton:hover {{ background:{ACCENT}; color:white; border-color:{ACCENT}; }}
+            QPushButton:hover    {{ background:{ACCENT};  color:white; border-color:{ACCENT}; }}
+            QPushButton:checked  {{ background:{ACCENT};  color:white; border-color:{ACCENT}; }}
+            QPushButton:!checked {{ background:{BG};      color:{FG};  border-color:{BORDER}; }}
             QSlider::groove:horizontal {{
                 height:4px; background:{BORDER}; border-radius:2px;
             }}
@@ -329,7 +467,7 @@ class FastenerViewer(QMainWindow):
         bl.setSpacing(8)
 
         # ── Color by ──────────────────────────────────────────────────────────
-        bl.addWidget(QLabel("Color by:"))
+        bl.addWidget(self._bar_label("Color by:"))
         self.col_combo = QComboBox()
         self.col_combo.setFixedWidth(170)
         self.col_combo.addItem("Default")
@@ -354,45 +492,53 @@ class FastenerViewer(QMainWindow):
 
         bl.addWidget(self._vsep())
 
-        # ── Opacity slider ─────────────────────────────────────────────────────
-        bl.addWidget(QLabel("Opacity:"))
+        # ── Opacity slider ────────────────────────────────────────────────────
+        bl.addWidget(self._bar_label("Opacity:"))
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(5, 100)
         self.opacity_slider.setValue(100)
         self.opacity_slider.setFixedWidth(80)
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
         bl.addWidget(self.opacity_slider)
-        self.opacity_val_lbl = QLabel("100%")
+        self.opacity_val_lbl = self._bar_label("100%")
         self.opacity_val_lbl.setFixedWidth(32)
         bl.addWidget(self.opacity_val_lbl)
 
         bl.addWidget(self._vsep())
 
         # ── Radius slider ─────────────────────────────────────────────────────
-        bl.addWidget(QLabel("Radius:"))
+        bl.addWidget(self._bar_label("Radius:"))
         self.radius_slider = QSlider(Qt.Horizontal)
         self.radius_slider.setRange(25, 400)
         self.radius_slider.setValue(100)
         self.radius_slider.setFixedWidth(80)
         self.radius_slider.valueChanged.connect(self._on_radius_changed)
         bl.addWidget(self.radius_slider)
-        self.radius_val_lbl = QLabel("1.0×")
+        self.radius_val_lbl = self._bar_label("1.0×")
         self.radius_val_lbl.setFixedWidth(32)
         bl.addWidget(self.radius_val_lbl)
 
         bl.addWidget(self._vsep())
 
-        # ── Pick info — compact: "EID: 1234 | Fx: 42.1" ──────────────────────
-        self.pick_lbl = QLabel("Right-click fastener")
-        self.pick_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # ── Pick info — pinned to bottom-right ────────────────────────────────
+        bl.addStretch()
+        self.pick_lbl = QLabel("")
+        self.pick_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.pick_lbl.setStyleSheet(
-            f"color:{FG_MONO};font-size:10px;font-family:monospace;")
-        bl.addWidget(self.pick_lbl, stretch=1)
+            f"color:{FG_MONO};font-size:10px;font-family:monospace;background:transparent;")
+        bl.addWidget(self.pick_lbl)
 
         return bar
 
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _bar_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("background:transparent;")
+        return lbl
+
     def _vsep(self):
-        sep = QFrame(); sep.setFrameShape(QFrame.VLine)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
         sep.setStyleSheet(f"background:{BORDER}; max-width:1px;")
         return sep
 
@@ -419,15 +565,12 @@ class FastenerViewer(QMainWindow):
             width:13px; height:13px; border:1px solid {BORDER};
             border-radius:3px; background:{BG};
         }}
-        QCheckBox::indicator:checked {{
-            background:{ACCENT}; border-color:{ACCENT};
-        }}
+        QCheckBox::indicator:checked {{ background:{ACCENT}; border-color:{ACCENT}; }}
         """
 
     def _edit_style(self):
         return (f"border:1px solid {BORDER}; border-radius:4px;"
-                f"padding:4px 7px; font-size:11px;"
-                f"background:{BG}; color:{FG};")
+                f"padding:4px 7px; font-size:11px; background:{BG}; color:{FG};")
 
     def _btn_style(self):
         return (f"border:1px solid {BORDER}; border-radius:4px;"
@@ -437,18 +580,31 @@ class FastenerViewer(QMainWindow):
     # =========================================================================
     # PROGRESS
     # =========================================================================
+    def _toggle_log(self):
+        visible = self.log_text.isVisible()
+        self.log_text.setVisible(not visible)
+        self.log_toggle_btn.setText("▼" if visible else "▶")
+        self.log_toggle_btn.setToolTip("Expand log" if visible else "Collapse log")
+
+    def _log(self, msg):
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{ts}] {msg}")
+
     def _start_busy(self, msg="Working..."):
         self.status_lbl.setText(msg)
-        self.progress.setVisible(True)
-        self._progress_val = 0; self._progress_dir = 1
+        self._log(msg)
+        self._progress_val = 0
+        self._progress_dir = 1
         self._progress_timer.start(30)
         QApplication.processEvents()
 
     def _stop_busy(self, msg=""):
         self._progress_timer.stop()
-        self.progress.setVisible(False); self.progress.setValue(0)
+        self.progress.setValue(0)
         if msg:
             self.status_lbl.setText(msg)
+            self._log(msg)
         QApplication.processEvents()
 
     def _swing_progress(self):
@@ -485,17 +641,20 @@ class FastenerViewer(QMainWindow):
 
     def _on_bdf_loaded(self, bdf, err):
         if err:
-            self._stop_busy(f"Error: {err}"); return
+            self._stop_busy(f"Error: {err}")
+            return
         self.bdf = bdf
-        self._pts_cache = self._nmap_cache = None
-        n_sh = sum(1 for e in bdf.elements.values() if e.type in ("CQUAD4","CTRIA3"))
+        self._pts_cache  = None
+        self._nmap_cache = None
+        n_sh = sum(1 for e in bdf.elements.values() if e.type in ("CQUAD4", "CTRIA3"))
         n_cb = sum(1 for e in bdf.elements.values() if e.type == "CBUSH")
         self._render_bdf()
         self._stop_busy(f"BDF loaded — {n_sh} shells, {n_cb} CBUSH")
 
     def _build_pts(self):
         if self._pts_cache is None:
-            nodes = []; nmap = {}
+            nodes = []
+            nmap  = {}
             for nid, node in self.bdf.nodes.items():
                 nmap[nid] = len(nodes)
                 nodes.append(node.get_position())
@@ -509,13 +668,16 @@ class FastenerViewer(QMainWindow):
     def _render_bdf(self):
         if not self.plotter or not self.bdf:
             return
+
         self.plotter.clear()
-        self._shell_actor = None
-        self._cbush_actor = None
-        self._rod_actors  = []
-        self._scalar_bar  = None
-        self._label_actors = []
+        self._shell_actor   = None
+        self._cbush_actor   = None
+        self._rod_actors    = []
+        self._scalar_bar    = None
+        self._label_actors  = []
         self._cached_bounds = None
+        self._base_radius   = None
+
         pts, nmap = self._build_pts()
 
         # ── Shells ────────────────────────────────────────────────────────────
@@ -537,12 +699,11 @@ class FastenerViewer(QMainWindow):
             mesh = pv.PolyData(pts, np.hstack(sh_cells))
             self._shell_actor = self.plotter.add_mesh(
                 mesh, color=COLOR_SHELL, show_edges=True,
-                edge_color=COLOR_SHELL_EDGE,
-                opacity=OPACITY_SHELL, pickable=False,
-                show_scalar_bar=False)
+                edge_color=COLOR_SHELL_EDGE, opacity=OPACITY_SHELL,
+                pickable=False, show_scalar_bar=False)
 
-        # ── 1-D elements (CROD / CBAR / CBEAM) ───────────────────────────────
-        ONE_D = ("CROD","CBAR","CBEAM","CBUSH1D","CONROD")
+        # ── 1-D elements ──────────────────────────────────────────────────────
+        ONE_D = ("CROD", "CBAR", "CBEAM", "CBUSH1D", "CONROD")
         for elem in self.bdf.elements.values():
             if elem.type not in ONE_D:
                 continue
@@ -552,16 +713,16 @@ class FastenerViewer(QMainWindow):
                     continue
                 p1 = np.array(self.bdf.nodes[nids[0]].get_position(), dtype=float)
                 p2 = np.array(self.bdf.nodes[nids[1]].get_position(), dtype=float)
-                line = pv.Line(p1, p2)
                 actor = self.plotter.add_mesh(
-                    line, color=FG_MONO, line_width=1,
+                    pv.Line(p1, p2), color=FG_MONO, line_width=1,
                     pickable=False, show_scalar_bar=False)
                 self._rod_actors.append(actor)
             except Exception:
                 continue
 
-        # ── CBUSH midpoints ───────────────────────────────────────────────────
-        self._cbush_centers = {}
+        # ── CBUSH endpoints + midpoints ─────────────────────────────────────────
+        self._cbush_centers   = {}   # eid -> midpoint (used for picking/labels)
+        self._cbush_endpoints = {}   # eid -> (p1, p2)  (used for true axis orientation)
         for eid, elem in self.bdf.elements.items():
             if elem.type != "CBUSH":
                 continue
@@ -571,14 +732,15 @@ class FastenerViewer(QMainWindow):
                     continue
                 p1 = np.array(self.bdf.nodes[nids[0]].get_position(), dtype=float)
                 p2 = np.array(self.bdf.nodes[nids[1]].get_position(), dtype=float)
-                self._cbush_centers[eid] = (p1 + p2) / 2.0
+                self._cbush_centers[eid]   = (p1 + p2) / 2.0
+                self._cbush_endpoints[eid] = (p1, p2)
             except Exception:
                 continue
 
         self.plotter.reset_camera()
         self.plotter.render()
 
-        # ── Cache bounds NOW (shells + nodes visible, CBUSH not yet added) ────
+        # Cache bounds BEFORE adding CBUSH actors (avoids inflated bounds later)
         try:
             self._cached_bounds = tuple(self.plotter.bounds)
         except Exception:
@@ -588,42 +750,46 @@ class FastenerViewer(QMainWindow):
         self.plotter.render()
 
     # =========================================================================
-    # CBUSH RENDER — cylinders
+    # CBUSH DEFAULT RENDER
     # =========================================================================
     def _render_cbush_default(self):
-        if not self._cbush_centers:
+        if not self._cbush_endpoints:
             return
-        pts  = np.array(list(self._cbush_centers.values()), dtype=float)
-        r    = _cbush_radius(self._cached_bounds, self._radius_scale)
-        mesh = _make_cylinder_mesh(pts, r)
-        op   = self.opacity_slider.value() / 100.0
+        eids = list(self._cbush_endpoints.keys())
+        p1s  = np.array([self._cbush_endpoints[e][0] for e in eids], dtype=float)
+        p2s  = np.array([self._cbush_endpoints[e][1] for e in eids], dtype=float)
+        # Store base radius (scale=1) so slider multiplications stay consistent
+        self._base_radius = _cbush_radius(self._cached_bounds, 1.0)
+        r  = self._base_radius * self._radius_scale
+        op = self.opacity_slider.value() / 100.0
+        mesh = _make_fastener_mesh(p1s, p2s, r)
         self._cbush_actor = self.plotter.add_mesh(
             mesh, color=COLOR_CBUSH, smooth_shading=True,
             opacity=op, pickable=True, show_scalar_bar=False)
 
     # =========================================================================
-    # OPACITY SLIDER
+    # OPACITY SLIDER  — controls shell transparency so fasteners show through
     # =========================================================================
     def _on_opacity_changed(self, val):
         self.opacity_val_lbl.setText(f"{val}%")
-        op = val / 100.0
-        if self._cbush_actor:
-            try: self._cbush_actor.GetProperty().SetOpacity(op)
-            except Exception: pass
+        if self._shell_actor:
+            try:
+                self._shell_actor.GetProperty().SetOpacity(val / 100.0)
+            except Exception:
+                pass
         if self.plotter:
             self.plotter.render()
 
     # =========================================================================
-    # RADIUS SLIDER  — rebuilds cylinder geometry at new scale
+    # RADIUS SLIDER  — full mesh rebuild at new scale
     # =========================================================================
     def _on_radius_changed(self, val):
-        scale = val / 100.0
-        self._radius_scale = scale
-        self.radius_val_lbl.setText(f"{scale:.2f}×")
-        self._recolor_cbush()          # full rebuild with new radius
+        self._radius_scale = val / 100.0
+        self.radius_val_lbl.setText(f"{self._radius_scale:.2f}×")
+        self._recolor_cbush()
 
     # =========================================================================
-    # FASTPPH
+    # FASTPPH CSV
     # =========================================================================
     def _load_fastpph(self, fn):
         import pandas as pd
@@ -661,10 +827,15 @@ class FastenerViewer(QMainWindow):
         import pandas as pd
         self._start_busy("Loading output xlsx...")
         try:
-            self.df_output = pd.read_excel(fn, sheet_name="Results")
-            self.df_output.columns = self.df_output.columns.str.strip()
-            self.df_output["Element ID"] = pd.to_numeric(
-                self.df_output["Element ID"], errors="coerce").astype("Int64")
+            df = pd.read_excel(fn, sheet_name="Results")
+            df.columns = df.columns.str.strip()
+            df["Element ID"] = pd.to_numeric(
+                df["Element ID"], errors="coerce").astype("Int64")
+            
+            # Only keep what you want
+            keep = ["Element ID", "RF", "Allowable", "Applied", "MS_tension", "MS_shear"]
+            self.df_output = df[[c for c in keep if c in df.columns]]
+            
             self._update_col_combo()
             self._stop_busy(f"Output loaded — {len(self.df_output)} rows")
             if self.bdf:
@@ -673,7 +844,7 @@ class FastenerViewer(QMainWindow):
             self._stop_busy(f"Output error: {e}")
 
     # =========================================================================
-    # COLUMN COMBO  — Diameter always discrete; Fx/Fy/Fz numeric
+    # COLUMN COMBO
     # =========================================================================
     def _update_col_combo(self):
         prev = self.col_combo.currentText()
@@ -681,8 +852,7 @@ class FastenerViewer(QMainWindow):
         self.col_combo.clear()
         self.col_combo.addItem("Default")
 
-        # numeric columns shown normally; Diameter shown as discrete categorical
-        numeric_cols = ["Fx", "Fy", "Fz"]
+        numeric_cols  = ["Fx", "Fy", "Fz"]
         discrete_cols = ["Diameter", "Fastener Name"]
 
         if self.df_fastpph is not None:
@@ -704,7 +874,7 @@ class FastenerViewer(QMainWindow):
         self.col_combo.blockSignals(False)
 
     def _on_col_changed(self):
-        pass
+        pass   # user presses Apply to commit
 
     # =========================================================================
     # LABEL TOGGLE
@@ -715,10 +885,8 @@ class FastenerViewer(QMainWindow):
         self._refresh_labels()
 
     def _refresh_labels(self):
-        """Remove existing labels then re-draw if toggled on."""
         if not self.plotter:
             return
-        # Remove old label actors
         for a in self._label_actors:
             try:
                 self.plotter.remove_actor(a)
@@ -730,11 +898,10 @@ class FastenerViewer(QMainWindow):
             self.plotter.render()
             return
 
-        col_text = self.col_combo.currentText()
-        eids     = list(self._cbush_centers.keys())
-
-        # Build a lookup for the displayed value
+        col_text   = self.col_combo.currentText()
+        eids       = list(self._cbush_centers.keys())
         eid_to_val = {}
+
         if col_text != "Default":
             if col_text.startswith("[fastpph]"):
                 col = col_text.replace("[fastpph] ", "").strip()
@@ -750,33 +917,25 @@ class FastenerViewer(QMainWindow):
                     except Exception:
                         pass
 
-        for eid in eids:
-            pos   = self._cbush_centers[eid]
-            # Offset label slightly above cylinder
-            label_pos = pos + np.array([0, 0,
-                _cbush_radius(self._cached_bounds, self._radius_scale) * 2])
+        r = (self._base_radius or _cbush_radius(self._cached_bounds, 1.0)) * self._radius_scale
 
-            if col_text == "Default" or eid not in eid_to_val:
-                text = str(eid)
+        for eid in eids:
+            pos       = self._cbush_centers[eid]
+            label_pos = pos + np.array([0, 0, r * 2])
+
+            if col_text != "Default" and eid in eid_to_val:
+                v    = eid_to_val[eid]
+                text = f"{v:.3g}" if isinstance(v, float) else str(v)
             else:
-                v = eid_to_val[eid]
-                if isinstance(v, float):
-                    text = f"{eid} | {v:.3g}"
-                else:
-                    text = f"{eid} | {v}"
+                text = str(eid)
 
             try:
                 actor = self.plotter.add_point_labels(
                     [label_pos], [text],
-                    font_size=9,
-                    text_color=FG,
-                    point_color=FG,
-                    point_size=0,
-                    shape=None,
-                    render_points_as_spheres=False,
-                    always_visible=True,
-                    shadow=False,
-                    pickable=False)
+                    font_size=9, text_color=FG,
+                    point_color=FG, point_size=0,
+                    shape=None, render_points_as_spheres=False,
+                    always_visible=True, shadow=False, pickable=False)
                 self._label_actors.append(actor)
             except Exception:
                 pass
@@ -784,36 +943,41 @@ class FastenerViewer(QMainWindow):
         self.plotter.render()
 
     # =========================================================================
-    # RECOLOR CBUSH
+    # RECOLOR CBUSH  — central rebuild used by Apply, radius slider, output load
+    # CBUSH cylinders always render fully opaque; the Opacity slider controls
+    # the shell mesh instead, so fasteners stay clearly visible through it.
     # =========================================================================
     def _recolor_cbush(self):
-        if not self.plotter or not self._cbush_centers:
+        if not self.plotter or not self._cbush_endpoints:
             return
 
         if self._cbush_actor is not None:
             self.plotter.remove_actor(self._cbush_actor)
             self._cbush_actor = None
         if self._scalar_bar is not None:
-            try: self.plotter.remove_scalar_bar()
-            except Exception: pass
+            try:
+                self.plotter.remove_scalar_bar()
+            except Exception:
+                pass
             self._scalar_bar = None
 
         col_text = self.col_combo.currentText()
-        eids     = list(self._cbush_centers.keys())
-        pts      = np.array([self._cbush_centers[e] for e in eids], dtype=float)
-        # Use cached bounds — never re-query after actors removed
-        r        = _cbush_radius(self._cached_bounds, self._radius_scale)
-        op       = self.opacity_slider.value() / 100.0
+        eids = list(self._cbush_endpoints.keys())
+        p1s  = np.array([self._cbush_endpoints[e][0] for e in eids], dtype=float)
+        p2s  = np.array([self._cbush_endpoints[e][1] for e in eids], dtype=float)
+        r    = (self._base_radius or _cbush_radius(self._cached_bounds, 1.0)) * self._radius_scale
 
+        # ── Default solid color ───────────────────────────────────────────────
         if col_text == "Default":
-            mesh = _make_cylinder_mesh(pts, r)
+            mesh = _make_fastener_mesh(p1s, p2s, r)
             self._cbush_actor = self.plotter.add_mesh(
                 mesh, color=COLOR_CBUSH, smooth_shading=True,
-                opacity=op, pickable=True, show_scalar_bar=False)
+                opacity=1.0, pickable=True, show_scalar_bar=False)
             self.plotter.render()
             self._refresh_labels()
             return
 
+        # ── Resolve column + dataframe ─────────────────────────────────────
         if col_text.startswith("[fastpph]"):
             col = col_text.replace("[fastpph] ", "").strip()
             df  = self.df_fastpph
@@ -822,28 +986,27 @@ class FastenerViewer(QMainWindow):
             df  = self.df_output
 
         if df is None or "Element ID" not in df.columns or col not in df.columns:
-            self._stop_busy(f"Column '{col}' not found"); return
+            self._stop_busy(f"Column '{col}' not found")
+            return
 
-        eid_to_val = dict(zip(df["Element ID"].astype(int), df[col]))
-
-        # Diameter is always treated as discrete categorical regardless of dtype
+        eid_to_val     = dict(zip(df["Element ID"].astype(int), df[col]))
         force_discrete = (col == "Diameter")
-
-        vals   = [eid_to_val.get(e) for e in eids]
-        is_num = (not force_discrete) and all(
+        vals           = [eid_to_val.get(e) for e in eids]
+        is_num         = (not force_discrete) and all(
             isinstance(v, (int, float)) and not (isinstance(v, float) and np.isnan(v))
             for v in vals if v is not None)
 
+        # ── Numeric (continuous colormap) ──────────────────────────────────
         if is_num:
             scalar_arr = np.array([
                 float(eid_to_val[e]) if e in eid_to_val else np.nan
                 for e in eids], dtype=float)
             valid = scalar_arr[~np.isnan(scalar_arr)]
-            clim  = [float(valid.min()), float(valid.max())] if len(valid) else [0, 1]
-            mesh  = _make_cylinder_mesh(pts, r, scalar_arr, col)
+            clim  = [float(valid.min()), float(valid.max())] if len(valid) else [0.0, 1.0]
+            mesh  = _make_fastener_mesh(p1s, p2s, r, scalar_arr, col)
             self._cbush_actor = self.plotter.add_mesh(
                 mesh, scalars=col, cmap="coolwarm",
-                smooth_shading=True, opacity=op,
+                smooth_shading=True, opacity=1.0,
                 clim=clim, pickable=True, show_scalar_bar=True,
                 scalar_bar_args=dict(
                     title=col, vertical=True,
@@ -851,15 +1014,16 @@ class FastenerViewer(QMainWindow):
                     width=0.04, height=0.70, n_labels=5,
                     color=FG, title_font_size=11, label_font_size=10))
             self._scalar_bar = col
+
+        # ── Discrete / categorical ────────────────────────────────────────
         else:
-            # Discrete / categorical coloring (also used for Diameter)
             unique  = sorted({str(eid_to_val[e]) for e in eids if e in eid_to_val})
             palette = [ACCENT, "#22c55e", "#f59e0b", "#ef4444",
                        "#a855f7", "#06b6d4", "#f97316", "#84cc16",
                        "#ec4899", "#14b8a6", "#fb923c", "#a3e635"]
-            v2c     = {v: palette[i % len(palette)] for i, v in enumerate(unique)}
-            mesh    = _make_cylinder_mesh(pts, r)
-            V       = mesh.n_points // len(eids) if eids else 1
+            v2c  = {v: palette[i % len(palette)] for i, v in enumerate(unique)}
+            mesh = _make_fastener_mesh(p1s, p2s, r)
+            V    = mesh.n_points // len(eids) if eids else 1
             per_pt_rgb = []
             for e in eids:
                 hex_c = v2c.get(str(eid_to_val.get(e, "")), COLOR_CBUSH)
@@ -867,7 +1031,7 @@ class FastenerViewer(QMainWindow):
             mesh.point_data["rgb"] = np.array(per_pt_rgb, dtype=float)
             self._cbush_actor = self.plotter.add_mesh(
                 mesh, scalars="rgb", rgb=True,
-                smooth_shading=True, opacity=op,
+                smooth_shading=True, opacity=1.0,
                 pickable=True, show_scalar_bar=False)
 
         self.plotter.render()
@@ -881,29 +1045,33 @@ class FastenerViewer(QMainWindow):
         if not self.chk_metal.isChecked() and not self.chk_composite.isChecked():
             self.status_lbl.setText("Select at least one: Metallic or Composite")
             return
-        xlsm = getattr(self, '_xlsm_path', None) or self.xlsm_edit.toolTip()
+        xlsm = self._xlsm_path or self.xlsm_edit.toolTip()
         if not xlsm or not os.path.exists(xlsm):
             self.status_lbl.setText("Please browse a .xlsm calculator file first")
             return
+        self.calc_btn.setEnabled(False)
         self._start_busy("Calculating... please wait")
         self._calc_thread = CalcThread(
-            xlsm=xlsm, run_metal=self.chk_metal.isChecked(),
+            xlsm=xlsm,
+            run_metal=self.chk_metal.isChecked(),
             run_composite=self.chk_composite.isChecked(),
             df_fastpph=self.df_fastpph,
-            df_joint=getattr(self, 'df_joint', None),
+            df_joint=self.df_joint,
             bdf_path=self.bdf_edit.toolTip())
         self._calc_thread.done.connect(self._on_calc_done)
         self._calc_thread.start()
 
     def _on_calc_done(self, result_path, err):
+        self.calc_btn.setEnabled(True)
         if err:
-            self._stop_busy(f"Calculation error: {err}"); return
+            self._stop_busy(f"Calculation error: {err}")
+            return
         self._stop_busy(f"Done — {result_path}")
         if result_path and os.path.exists(result_path):
             self._load_output(result_path)
 
     # =========================================================================
-    # RIGHT CLICK  — compact status: "EID: 1234 | ColName: value"
+    # RIGHT-CLICK PICK
     # =========================================================================
     def _on_click(self, pos):
         if not pos or not self._cbush_centers:
@@ -925,9 +1093,6 @@ class FastenerViewer(QMainWindow):
         eid      = eids[idx]
         col_text = self.col_combo.currentText()
 
-        # Determine which column value to show
-        col_val = None
-        col_name = None
         if col_text != "Default":
             if col_text.startswith("[fastpph]"):
                 col_name = col_text.replace("[fastpph] ", "").strip()
@@ -939,13 +1104,16 @@ class FastenerViewer(QMainWindow):
             if df is not None and "Element ID" in df.columns and col_name in df.columns:
                 row = df[df["Element ID"].astype(int) == eid]
                 if not row.empty:
-                    v = row.iloc[0][col_name]
-                    col_val = f"{v:.4g}" if isinstance(v, float) else str(v)
+                    v       = row.iloc[0][col_name]
+                    val_str = f"{v:.4g}" if isinstance(v, float) else str(v)
+                    text    = f"EID {eid}  {col_name}: {val_str}"
+                    self.pick_lbl.setText(text)
+                    self._log(text)
+                    return
 
-        if col_val is not None:
-            self.pick_lbl.setText(f"EID: {eid}  |  {col_name}: {col_val}")
-        else:
-            self.pick_lbl.setText(f"EID: {eid}")
+        text = f"EID {eid}"
+        self.pick_lbl.setText(text)
+        self._log(text)
 
     # =========================================================================
     # CLOSE
@@ -954,24 +1122,6 @@ class FastenerViewer(QMainWindow):
         if self.plotter:
             self.plotter.close()
         super().closeEvent(event)
-
-
-# =============================================================================
-# CALC THREAD
-# =============================================================================
-class CalcThread(QThread):
-    done = pyqtSignal(str, str)
-
-    def __init__(self, xlsm, run_metal, run_composite,
-                 df_fastpph, df_joint, bdf_path):
-        super().__init__()
-        self.xlsm=xlsm; self.run_metal=run_metal
-        self.run_composite=run_composite; self.df_fastpph=df_fastpph
-        self.df_joint=df_joint; self.bdf_path=bdf_path
-
-    def run(self):
-        try:    self.done.emit("", "CalcThread not wired yet")
-        except Exception as e: self.done.emit("", str(e))
 
 
 # =============================================================================
