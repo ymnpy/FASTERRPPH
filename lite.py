@@ -494,7 +494,7 @@ class App(tk.Tk):
 
             self._set_status("Reading fastpph CSV…")
             df_fast = pd.read_csv(paths["fastpph CSV"], skiprows=2,
-                                  sep=None, engine="python")
+                                sep=None, engine="python")
             df_fast.columns = df_fast.columns.str.strip()
 
             keep_cols = [
@@ -513,7 +513,27 @@ class App(tk.Tk):
             df_joint = pd.read_csv(paths["JOINT CSV"])
             df = pd.merge(df_fast, df_joint, on="Element ID", how="left")
             df["Pitch"] = (df["box dimension"].astype(float) /
-                           df["Fastener Diameter"].astype(float))
+                        df["Fastener Diameter"].astype(float))
+
+            # ── Combine duplicate CBUSH rows ─────────────────────────
+            LOAD_COLS = ["Fx", "Fy", "Fz", "Nx bypass", "Ny bypass", "Nxy bypass",
+                        "Mx total", "My total", "Mxy total"]
+
+            """
+            GROUP_KEYS = ["Component Name", "Element ID", "elem 1 Node id",
+                        "elem 2 id", "elem 2 Node id", "box dimension",
+                        "file Name", "LoadCase Name"]
+            """
+            GROUP_KEYS = ["Component Name", "Element ID", "elem 1 Node id",
+                        "file Name", "LoadCase Name"]
+            
+            df = df.groupby(GROUP_KEYS, as_index=False).agg(
+                **{c: (c, "sum") for c in LOAD_COLS},
+                **{"Fastener Diameter": ("Fastener Diameter", "first"),
+                "Pitch":             ("Pitch",             "first"),
+                "DLS Ratio":         ("DLS Ratio",         "max")}
+            )
+            # ─────────────────────────────────────────────────────────
 
             self._set_status("Extracting properties from BDF…")
             results = df["Component Name"].apply(
